@@ -28,17 +28,17 @@ All transaction data is sourced from **[OpenSecrets](https://www.opensecrets.org
 
 ## Key Results Summary
 
-| Metric                          | CAAR5           | CAAR10          | CAAR120         |
-|----------------------------------|------------------|------------------|------------------|
-| **Mean CAAR**                    | -1.37%           | -1.30%           | -6.45%           |
-| **T-Statistic**                  | -27.12           | -21.68           | -38.19           |
-| **P-Value**                      | 7.52e-161        | 8.23e-104        | < 0.0001         |
-| **Statistical Significance?**    | Yes            |  Yes            | Yes            |
-| **R²: Sector → CAAR**            | 0.0024 (0.24%)   | 0.0022 (0.22%)   | 0.0020 (0.20%)   |
-| **R²: Party → CAAR**             | 0.0022 (0.22%)   | 0.0021 (0.21%)   | 0.0018 (0.18%)   |
-| **R²: Fama-French Model**        | ~0.00            | ~0.00            | ~0.00            |
-| **Model P-Value (FF regression)**| 0.112            | 0.349            | 0.584            |
-| **Conclusion (Fama-French)**     |  Not explanatory |  Not explanatory |  Not explanatory |
+| **Metric**                        | **CAR5**        | **CAR10**       | **CAR120**      |
+| --------------------------------- | --------------- | --------------- | --------------- |
+| **Mean CAR**                      | -1.37%          | -1.30%          | -6.45%          |
+| **T-Statistic**                   | -27.12          | -21.68          | -38.19          |
+| **P-Value**                       | 7.52e-161       | 8.23e-104       | < 0.0001        |
+| **Statistical Significance?**     | Yes             | Yes             | Yes             |
+| **R²: Sector → CAR**              | 0.0024 (0.24%)  | 0.0022 (0.22%)  | 0.0020 (0.20%)  |
+| **R²: Party → CAR**               | 0.0022 (0.22%)  | 0.0021 (0.21%)  | 0.0018 (0.18%)  |
+| **R²: Fama-French Model**         | \~0.00          | \~0.00          | \~0.00          |
+| **Model P-Value (FF Regression)** | 0.112           | 0.349           | 0.584           |
+| **Conclusion (Fama-French)**      | Not explanatory | Not explanatory | Not explanatory |
 
 ---
 
