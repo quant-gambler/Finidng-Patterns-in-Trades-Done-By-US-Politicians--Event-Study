@@ -1,0 +1,591 @@
+import pandas as pd
+import numpy as np
+import statsmodels.api as sm
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.linear_model import LinearRegression
+from sklearn.metrics import r2_score
+from scipy.stats import ttest_1samp
+
+# Set Seaborn style for consistent plotting
+sns.set(style="whitegrid")
+
+# --- Part 1: Utility Functions ---
+
+def safe_read_csv(filepath, label, required=True):
+    """Safely reads a CSV file, with checks for existence and content."""
+    try:
+        df = pd.read_csv(filepath)
+        if df.empty:
+            print(f"Warning: {label} is empty.")
+        else:
+            print(f"Success: {label} loaded.")
+        return df
+    except FileNotFoundError:
+        print(f"Error: File not found: {filepath}")
+        if required:
+            raise FileNotFoundError(f"Cannot proceed without {label}. Exiting.")
+        return None
+    except Exception as e:
+        print(f"Error loading {label}: {e}")
+        if required:
+            raise Exception(f"Cannot proceed without {label}. Exiting.")
+        return None
+
+def safe_read_excel_sheet(xls, sheet_name, required=True):
+    """Safely reads a specific sheet from an Excel file."""
+    try:
+        df = xls.parse(sheet_name)
+        if df.empty:
+            print(f"Warning: {sheet_name} is empty.")
+        else:
+            print(f"Success: {sheet_name} loaded.")
+        return df
+    except ValueError:
+        print(f"Error: Sheet not found: {sheet_name}")
+        if required:
+            raise ValueError(f"Cannot proceed without sheet '{sheet_name}'. Exiting.")
+        return None
+    except Exception as e:
+        print(f"Error loading sheet {sheet_name}: {e}")
+        if required:
+            raise Exception(f"Cannot proceed without sheet '{sheet_name}'. Exiting.")
+        return None
+
+def clean_amount(val):
+    """Cleans and converts 'amount' values to numeric, handling various formats."""
+    if isinstance(val, str):
+        val = val.replace('$', '').replace(',', '').strip()
+        if '-' in val: # Handle ranges like "100-200" by taking the average
+            try:
+                parts = list(map(float, val.split('-')))
+                return sum(parts) / len(parts)
+            except ValueError:
+                return np.nan # Return NaN if parts are not valid numbers
+        try:
+            return float(val)
+        except ValueError:
+            return np.nan # Return NaN if conversion fails
+    return pd.to_numeric(val, errors='coerce') # Coerce non-strings directly
+
+def get_estimation_data(df, ticker, date, window):
+    """Retrieves data for the estimation window for a given ticker and date."""
+    start = date - pd.Timedelta(days=window * 1.5) # Provide a buffer for available data
+    end = date - pd.Timedelta(days=1) # Estimation window ends one day before event
+    est_df = df[(df['Ticker'] == ticker) & (df['Date'] >= start) & (df['Date'] <= end)]
+    # Ensure we get exactly 'window' days if available
+    return est_df.tail(window) if len(est_df) >= window else None
+
+def calc_beta_and_expected(est_df, rf):
+    """Calculates Beta, Alpha, and Expected Return using OLS regression."""
+    if est_df is None or len(est_df) < 2: # Need at least two data points for regression
+        return None, None, None, None
+
+    # Calculate excess returns
+    est_df['Excess_Stock_Return'] = est_df['Daily_Return'] - rf
+    est_df['Excess_Market_Return'] = est_df['Market_Return'] - rf
+
+    # Prepare for OLS regression
+    X = sm.add_constant(est_df['Excess_Market_Return'])
+    y = est_df['Excess_Stock_Return']
+
+    try:
+        model = sm.OLS(y, X, missing='drop').fit() # Drop missing values for robustness
+        beta = model.params.get('Excess_Market_Return')
+        alpha = model.params.get('const')
+
+        # Calculate expected returns for the estimation period based on the model
+        # Note: This expected return is for the estimation period's market returns
+        expected_returns = rf + beta * (est_df['Market_Return'] - rf) + alpha
+        return beta, alpha, model, expected_returns
+    except Exception as e:
+        print(f"Error in OLS regression: {e}")
+        return None, None, None, None
+
+def calc_abnormal(actual, expected):
+    """Calculates abnormal returns."""
+    return actual - expected if actual is not None and expected is not None else pd.Series(dtype=float)
+
+
+# --- Part 2: Load Data from Excel File ---
+
+# Define file paths and parameters
+excel_file_path = "New1.xlsx"
+estimation_window_days = 250
+risk_free_rate_daily = 0.01 / 252 # Annual risk-free rate converted to daily
+
+print("--- Loading Data ---")
+xls = pd.ExcelFile(excel_file_path)
+
+# Load required sheets using the utility function
+master_sheet = safe_read_excel_sheet(xls, "Master Sheet")
+stock_prices = safe_read_excel_sheet(xls, "Stock Closing Price")
+market_prices = safe_read_excel_sheet(xls, "Market Closing Price")
+stock_data = safe_read_excel_sheet(xls, "Stock Data", required=False) # Optional sheet
+
+
+# --- Part 3: Clean and Merge Data ---
+
+print("\n--- Cleaning and Merging Data ---")
+
+# Normalize and map master_sheet columns to expected names
+print("Original columns in master_sheet:", master_sheet.columns.tolist())
+
+# Rename common variations of 'Trade Date' and 'Ticker'
+rename_map_master = {
+    'transaction_date': 'Trade Date',
+    'trade_date': 'Trade Date',
+    'TradeDate': 'Trade Date',
+    'Trade_Date': 'Trade Date',
+    'date': 'Trade Date', # If 'date' refers to trade date in master sheet
+    'ticker': 'Ticker',
+    'TIC': 'Ticker',
+    'Tic': 'Ticker'
+}
+master_sheet.rename(columns={k: v for k, v in rename_map_master.items() if k in master_sheet.columns}, inplace=True)
+
+# Apply title casing and cleanup for uniformity across all columns
+master_sheet.columns = master_sheet.columns.str.strip().str.replace('_', ' ').str.replace('-', ' ').str.title()
+print("Cleaned columns in master_sheet:", master_sheet.columns.tolist())
+
+# Verify essential columns are present after renaming
+required_master_cols = {'Trade Date', 'Ticker'}
+if not required_master_cols.issubset(master_sheet.columns):
+    missing = required_master_cols - set(master_sheet.columns)
+    raise KeyError(f"Missing required columns in master_sheet: {missing}. Please check your Excel file column names.")
+
+# Rename columns for stock_prices DataFrame for consistency
+# IMPORTANT: Ensure 'Ticker' is correctly mapped for stock_prices
+stock_prices.rename(columns={
+    'date': 'Date',
+    'tic': 'Ticker', # This maps 'tic' to 'Ticker' - check if your column is named 'tic' in "Stock Closing Price"
+    'prccd': 'Close',
+    'returns': 'Daily_Return'
+    # Add other potential variations if 'tic' isn't the correct source for Ticker
+    # e.g., 'symbol': 'Ticker', 'stock_symbol': 'Ticker'
+}, inplace=True)
+
+# Rename columns for market_prices DataFrame for consistency
+# IMPORTANT: Ensure 'Date' and 'Market_Return' are correctly mapped for market_prices
+market_prices.rename(columns={
+    'date': 'Date', # If your date column in "Market Closing Price" is 'date'
+    'returns': 'Market_Return', # If your returns column in "Market Closing Price" is 'returns'
+    'tic': 'Market_Ticker', # If you also want to keep the market ticker
+    'prccd': 'Market_Close', # If you also want to keep the market closing price
+    # Add other potential variations for Date or Market_Return based on your "Market Closing Price" sheet
+    # e.g., 'Trade_Date_Col_In_Excel': 'Date',
+    # 'Mkt_Returns_Col_In_Excel': 'Market_Return'
+}, inplace=True)
+
+# Ensure 'Ticker' is correctly mapped for stock_data if it exists
+if stock_data is not None and not stock_data.empty:
+    stock_data.rename(columns={
+        'ticker': 'Ticker', # This assumes 'ticker' in stock_data - check your sheet
+        'tic': 'Ticker',    # Add if 'tic' is used in stock_data
+        'symbol': 'Ticker'  # Add if 'symbol' is used in stock_data
+        # Add other potential variations based on your 'Stock Data' sheet
+    }, inplace=True)
+else:
+    print("Stock Data DataFrame is empty or None, skipping its renaming.")
+
+# Convert date columns to datetime objects and handle NaNs
+for df, date_col in [(master_sheet, 'Trade Date'), (stock_prices, 'Date'), (market_prices, 'Date')]:
+    # Check if the date_col exists in the DataFrame before attempting conversion
+    if date_col in df.columns:
+        df[date_col] = pd.to_datetime(df[date_col], errors='coerce')
+        df.dropna(subset=[date_col], inplace=True)
+    else:
+        raise KeyError(f"Date column '{date_col}' not found in {df.name if hasattr(df, 'name') else 'a DataFrame'}.")
+
+
+# Convert return columns to numeric and handle NaNs
+stock_prices['Daily_Return'] = pd.to_numeric(stock_prices['Daily_Return'], errors='coerce')
+market_prices['Market_Return'] = pd.to_numeric(market_prices['Market_Return'], errors='coerce')
+stock_prices.dropna(subset=['Daily_Return'], inplace=True)
+market_prices.dropna(subset=['Market_Return'], inplace=True)
+
+# Debugging prints before merge operations
+print("\n--- Debugging Merge Issues ---")
+print("Columns in stock_prices before merge with stock_data:", stock_prices.columns.tolist())
+if stock_data is not None:
+    print("Columns in stock_data before merge:", stock_data.columns.tolist())
+print("Columns in market_prices before merge with stock_prices:", market_prices.columns.tolist())
+print("--- End Debugging ---")
+
+
+# Merge stock_data if available
+if stock_data is not None and not stock_data.empty:
+    # Before merging, let's re-verify columns just in case
+    if 'Ticker' not in stock_prices.columns:
+        raise KeyError("Error: 'Ticker' column is missing in stock_prices after renaming. Cannot merge with stock_data.")
+    if 'Ticker' not in stock_data.columns:
+        raise KeyError("Error: 'Ticker' column is missing in stock_data after renaming. Cannot merge with stock_data.")
+
+    stock_prices = pd.merge(stock_prices, stock_data, on='Ticker', how='left')
+    print("Stock Data merged with Stock Prices.")
+else: # This 'else' correctly positioned for the if/else block
+    print("Stock Data DataFrame is empty or None, skipping its merging.")
+
+# Merge stock prices with market prices
+# Verify 'Date' and 'Market_Return' are present in market_prices right before the merge
+if 'Date' not in market_prices.columns:
+    raise KeyError("Error: 'Date' column is missing in market_prices after renaming/cleaning.")
+if 'Market_Return' not in market_prices.columns:
+    raise KeyError("Error: 'Market_Return' column is missing in market_prices after renaming/cleaning.")
+
+merged_prices = pd.merge(stock_prices, market_prices[['Date', 'Market_Return']], on='Date', how='left')
+merged_prices.dropna(subset=['Market_Return'], inplace=True) # Drop rows where market return is missing
+print("Stock and Market Prices merged.")
+
+
+# --- Part 4: Event Study Logic and CAR Calculation ---
+
+print("\n--- Calculating Event Study CARs ---")
+
+event_windows = {'CAR5': (-5, 5), 'CAR10': (-10, 10), 'CAR120': (-120, 120)}
+# Buffer for event window to ensure enough data for relative days
+buffer_days = max(abs(v[0]) for v in event_windows.values()) * 1.5
+
+results = []
+for index, trade in master_sheet.iterrows():
+    ticker, t_date = trade['Ticker'], trade['Trade Date']
+
+    # Get estimation data and calculate beta/alpha
+    est_data = get_estimation_data(merged_prices, ticker, t_date, estimation_window_days)
+    beta, alpha, _, _ = calc_beta_and_expected(est_data, risk_free_rate_daily)
+
+    if beta is None:
+        # print(f"Skipping {ticker} on {t_date.date()}: Could not calculate beta (insufficient estimation data or regression error).")
+        continue
+
+    # Define event window for extracting actual returns
+    win_start = t_date - pd.Timedelta(days=int(buffer_days))
+    win_end = t_date + pd.Timedelta(days=int(buffer_days))
+
+    event_df = merged_prices[
+        (merged_prices['Ticker'] == ticker) &
+        (merged_prices['Date'] >= win_start) &
+        (merged_prices['Date'] <= win_end)
+    ].copy()
+
+    if event_df.empty:
+        # print(f"Skipping {ticker} on {t_date.date()}: No data found in event window.")
+        continue
+
+    # Calculate expected and abnormal returns for the event window
+    event_df['Expected_Return'] = risk_free_rate_daily + beta * (event_df['Market_Return'] - risk_free_rate_daily) + alpha
+    event_df['Abnormal_Return'] = calc_abnormal(event_df['Daily_Return'], event_df['Expected_Return'])
+    event_df['Relative_Day'] = (event_df['Date'] - t_date).dt.days
+
+    row = {'Ticker': ticker, 'Trade_Date': t_date}
+    for name, (low, high) in event_windows.items():
+        car_df = event_df[(event_df['Relative_Day'] >= low) & (event_df['Relative_Day'] <= high)]
+        row[name] = car_df['Abnormal_Return'].sum() if not car_df.empty else np.nan
+
+    results.append(row)
+
+# Final Data Assembly and Save
+event_study_df = pd.DataFrame(results)
+
+# Clean and standardize master_sheet columns before merging
+# Ensure master_sheet columns are uniform before merging (already done in Part 3, but good to re-check if needed)
+master_sheet_for_merge = master_sheet.copy()
+master_sheet_for_merge.columns = master_sheet_for_merge.columns.str.lower().str.replace(' ', '_')
+
+event_study_df = pd.merge(
+    event_study_df,
+    master_sheet_for_merge[['trade_date', 'party', 'type', 'amount', 'sector']],
+    left_on='Trade_Date',
+    right_on='trade_date',
+    how='left'
+)
+event_study_df.drop(columns=['trade_date'], inplace=True)
+
+# Apply clean_amount function
+event_study_df['amount'] = event_study_df['amount'].apply(clean_amount)
+
+# Save results
+output_filename = "Event_Study_CARs.csv"
+event_study_df.to_csv(output_filename, index=False)
+print(f"Event study results saved to {output_filename}")
+
+
+# --- Part 5: AAR & CAAR Calculation and Plotting ---
+
+print("\n--- Plotting AAR and CAAR ---")
+
+def plot_aar_caar(event_df_results, merged_prices_df, estimation_days, rf_rate, event_win_dict):
+    """Calculates and plots AAR and CAAR."""
+    all_ar = []
+    # This loop recalculates ARs for plotting across the full event window
+    # You might want to optimize this if `event_study_df` already contains `Abnormal_Return` series for each event.
+    # For now, following the original logic to ensure a consistent AR calculation for AAR/CAAR plot.
+    for idx, trade in event_df_results.iterrows():
+        ticker = trade['Ticker']
+        t_date = trade['Trade_Date']
+
+        buffer = max(abs(w[0]) for w in event_win_dict.values()) * 1.5
+        # Set start and end for the comprehensive AAR/CAAR plot window
+        start_date_plot = t_date - pd.Timedelta(days=int(buffer))
+        end_date_plot = t_date + pd.Timedelta(days=int(buffer))
+
+        sub_df = merged_prices_df[
+            (merged_prices_df['Ticker'] == ticker) &
+            (merged_prices_df['Date'] >= start_date_plot) &
+            (merged_prices_df['Date'] <= end_date_plot)
+        ].copy()
+
+        if sub_df.empty: continue
+
+        est_data = get_estimation_data(merged_prices_df, ticker, t_date, estimation_days)
+        beta, alpha, _, _ = calc_beta_and_expected(est_data, rf_rate)
+        if beta is None: continue
+
+        sub_df['Expected_Return'] = rf_rate + beta * (sub_df['Market_Return'] - rf_rate) + alpha
+        sub_df['Abnormal_Return'] = sub_df['Daily_Return'] - sub_df['Expected_Return']
+        sub_df['Relative_Day'] = (sub_df['Date'] - t_date).dt.days
+
+        # Filter to the common plotting window, e.g., -120 to +120 days
+        sub_df = sub_df[(sub_df['Relative_Day'] >= -120) & (sub_df['Relative_Day'] <= 120)]
+        if not sub_df.empty:
+            all_ar.append(sub_df[['Relative_Day', 'Abnormal_Return']])
+
+    if not all_ar:
+        print("Warning: Not enough data to plot AAR/CAAR.")
+        return
+
+    # Combine all individual abnormal returns and calculate AAR/CAAR
+    all_events_ar_df = pd.concat(all_ar, ignore_index=True)
+    aar_df = all_events_ar_df.groupby('Relative_Day')['Abnormal_Return'].mean().reset_index()
+    aar_df.rename(columns={'Abnormal_Return': 'AAR'}, inplace=True)
+    aar_df['CAAR'] = aar_df['AAR'].cumsum()
+
+    # Plot AAR
+    plt.figure(figsize=(12, 5))
+    sns.lineplot(x='Relative_Day', y='AAR', data=aar_df)
+    plt.axvline(0, linestyle='--', color='red', label='Event Day (0)')
+    plt.title("Average Abnormal Return (AAR)")
+    plt.xlabel("Days from Event")
+    plt.ylabel("AAR")
+    plt.legend()
+    plt.grid(True)
+    plt.tight_layout()
+    plt.show()
+
+    # Plot CAAR
+    plt.figure(figsize=(12, 5))
+    sns.lineplot(x='Relative_Day', y='CAAR', data=aar_df, color='green')
+    plt.axvline(0, linestyle='--', color='red', label='Event Day (0)')
+    plt.title("Cumulative Average Abnormal Return (CAAR)")
+    plt.xlabel("Days from Event")
+    plt.ylabel("CAAR")
+    plt.legend()
+    plt.grid(True)
+    plt.tight_layout()
+    plt.show()
+
+plot_aar_caar(event_study_df.head(50), merged_prices, estimation_window_days, risk_free_rate_daily, event_windows)
+
+# --- Part 6: CAR Distributions ---
+
+print("\n--- Plotting CAR Distributions ---")
+for car_col in ['CAR5', 'CAR10', 'CAR120']:
+    plt.figure(figsize=(10, 4))
+    sns.histplot(event_study_df[car_col].dropna(), kde=True, bins=30)
+    plt.title(f"Distribution of {car_col}")
+    plt.xlabel(car_col)
+    plt.ylabel("Frequency")
+    plt.grid(True)
+    plt.tight_layout()
+    plt.show()
+
+
+# --- Part 7: Sector-Wise CAR Plot ---
+
+print("\n--- Plotting Sector-Wise CARs ---")
+
+# Ensure 'sector' column is clean for grouping
+event_study_df['sector'] = event_study_df['sector'].astype(str).str.strip().str.title()
+
+plt.figure(figsize=(14, 6))
+sector_mean = event_study_df.groupby('sector')[['CAR5']].mean().sort_values(by='CAR5', ascending=False).reset_index()
+sns.barplot(data=sector_mean, x='sector', y='CAR5')
+plt.title("Average CAR5 by Sector")
+plt.xticks(rotation=45, ha='right')
+plt.xlabel("Sector")
+plt.ylabel("Average CAR5")
+plt.grid(axis='y')
+plt.tight_layout()
+plt.show()
+
+# CAAR Comparison by Sector and Event Window
+caar_plot_df = event_study_df[['sector', 'CAR5', 'CAR10', 'CAR120']].dropna()
+caar_melted = caar_plot_df.melt(
+    id_vars='sector',
+    value_vars=['CAR5', 'CAR10', 'CAR120'],
+    var_name='Window',
+    value_name='CAAR' # Renamed for clarity in plot
+)
+plt.figure(figsize=(14, 6))
+sns.barplot(data=caar_melted, x='sector', y='CAAR', hue='Window')
+plt.xticks(rotation=45, ha='right')
+plt.title('CAAR Comparison by Sector and Event Window')
+plt.axhline(0, color='black', linestyle='--', linewidth=0.7)
+plt.tight_layout()
+plt.legend(title='Window')
+plt.show()
+
+
+# --- Part 8: Fama-French Regression Analysis (3-Factor Model) - Simulated Factors ---
+
+print("\n--- Performing Fama-French Regression (Simulated Factors) ---")
+
+# Create a copy for Fama-French analysis to avoid modifying original event_study_df extensively
+fama_merge = event_study_df.copy()
+
+# Ensure 'Trade_Date' is datetime for consistency, already done but double-check if needed.
+if not pd.api.types.is_datetime64_any_dtype(fama_merge['Trade_Date']):
+    fama_merge['Trade_Date'] = pd.to_datetime(fama_merge['Trade_Date'], errors='coerce')
+    fama_merge.dropna(subset=['Trade_Date'], inplace=True) # Drop rows where Trade_Date couldn't be parsed
+
+# Simulate Fama-French factors (MKT-RF, SMB, HML) and Risk-Free Rate (RF)
+# In a real scenario, you'd load these from a source like Kenneth French's data library
+np.random.seed(42) # for reproducibility
+sample_size = len(fama_merge)
+fama_merge['MKT_RF'] = np.random.normal(0, 0.01, sample_size) # Market excess return
+fama_merge['SMB'] = np.random.normal(0, 0.005, sample_size) # Small Minus Big (size factor)
+fama_merge['HML'] = np.random.normal(0, 0.005, sample_size) # High Minus Low (value factor)
+fama_merge['RF'] = risk_free_rate_daily # Use the defined risk-free rate
+
+# Regression setup: X includes constant and factors, y is the excess CAR
+X_ff = sm.add_constant(fama_merge[['MKT_RF', 'SMB', 'HML']])
+
+for car_col_name in ['CAR5', 'CAR10', 'CAR120']:
+    # The dependent variable is the "excess return" (CAR - RF)
+    y_ff = fama_merge[car_col_name] - fama_merge['RF']
+
+    # Fit OLS model, dropping rows with missing values in y or X
+    model_ff = sm.OLS(y_ff, X_ff, missing='drop').fit()
+    
+    # Predict values only for the rows used in the model fit
+    # Get the index of the rows used in the model
+    valid_index = y_ff.dropna().index.intersection(X_ff.dropna().index)
+    
+    if not valid_index.empty:
+        fama_merge.loc[valid_index, f'predicted_{car_col_name}'] = model_ff.predict(X_ff.loc[valid_index])
+    else:
+        fama_merge[f'predicted_{car_col_name}'] = np.nan # Set to NaN if no valid data for prediction
+        
+    print(f"\nFama-French Regression for {car_col_name} (Excess Return):")
+    print(model_ff.summary())
+
+    # Plot actual vs predicted, using only non-null values for plotting
+    plot_data_y = y_ff.loc[valid_index]
+    plot_data_x = model_ff.predict(X_ff.loc[valid_index])
+
+    if not plot_data_y.empty:
+        plt.figure(figsize=(8, 6))
+        sns.scatterplot(x=plot_data_x, y=plot_data_y, alpha=0.3, s=10) # Use smaller points for large datasets
+        plt.xlabel("Predicted Excess Return")
+        plt.ylabel(f"Actual {car_col_name} - RF")
+        plt.title(f"Actual vs Predicted for {car_col_name} (Fama-French Model)")
+        plt.grid(True)
+        plt.tight_layout()
+        plt.show()
+    else:
+        print(f"No valid data to plot for {car_col_name} after Fama-French regression.")
+
+
+# --- Part 9: R-squared by Sector and Party ---
+
+print("\n--- Explained Variance (R-squared) Analysis ---")
+
+# Ensure 'sector' and 'party' columns are clean and consistent
+fama_merge['sector'] = fama_merge['sector'].astype(str).str.strip().str.title()
+fama_merge['party'] = fama_merge['party'].astype(str).str.strip().str.title()
+
+# R-squared for CAR5 by Sector
+print("\nExplained Variance (R-squared) of CAR5 by Sector:")
+sector_dummies = pd.get_dummies(fama_merge['sector'], prefix='Sector', drop_first=True) # Use prefix for clarity
+# Align indices before concatenating and fitting
+y_sector = fama_merge['CAR5'].dropna()
+common_index_sector = y_sector.index.intersection(sector_dummies.index)
+
+if not common_index_sector.empty:
+    X_sector = sector_dummies.loc[common_index_sector]
+    y_sector_aligned = y_sector.loc[common_index_sector]
+    model_sector = LinearRegression().fit(X_sector, y_sector_aligned)
+    print(f"R² (CAR5 ~ Sector): {r2_score(y_sector_aligned, model_sector.predict(X_sector)):.4f}")
+else:
+    print("Not enough common data points to calculate R-squared for Sector.")
+
+
+# R-squared for CAR5 by Party
+print("\nExplained Variance (R-squared) of CAR5 by Party:")
+party_dummies = pd.get_dummies(fama_merge['party'], prefix='Party', drop_first=True)
+# Align indices
+y_party = fama_merge['CAR5'].dropna()
+common_index_party = y_party.index.intersection(party_dummies.index)
+
+if not common_index_party.empty:
+    X_party = party_dummies.loc[common_index_party]
+    y_party_aligned = y_party.loc[common_index_party]
+    model_party = LinearRegression().fit(X_party, y_party_aligned)
+    print(f"R² (CAR5 ~ Party): {r2_score(y_party_aligned, model_party.predict(X_party)):.4f}")
+else:
+    print("Not enough common data points to calculate R-squared for Party.")
+
+
+# --- Part 10: Time-Series Plots for CAR Evolution by Year and Sector ---
+
+print("\n--- Plotting CAR Evolution and Distribution ---")
+
+fama_merge['Year'] = fama_merge['Trade_Date'].dt.year.fillna(0).astype(int) # Ensure 'Year' is an integer
+
+for car_col_name in ['CAR5', 'CAR10', 'CAR120']:
+    # Average CAR Over Time (Line Plot)
+    plt.figure(figsize=(10, 5))
+    # Group by Year and calculate mean, then plot
+    mean_car_by_year = fama_merge.groupby('Year')[car_col_name].mean().reset_index()
+    if not mean_car_by_year.empty:
+        sns.lineplot(data=mean_car_by_year, x='Year', y=car_col_name, marker='o')
+        plt.title(f"Average {car_col_name} Over Time")
+        plt.ylabel(car_col_name)
+        plt.xlabel("Year")
+        plt.grid(True)
+        plt.tight_layout()
+        plt.show()
+    else:
+        print(f"No data to plot Average {car_col_name} Over Time.")
+
+
+    # CAR Distribution by Sector (Box Plot)
+    plt.figure(figsize=(14, 6))
+    if not fama_merge.empty and 'sector' in fama_merge.columns:
+        sns.boxplot(data=fama_merge, x='sector', y=car_col_name)
+        plt.xticks(rotation=45, ha='right')
+        plt.title(f"{car_col_name} Distribution by Sector")
+        plt.ylabel(car_col_name)
+        plt.xlabel("Sector")
+        plt.grid(True, axis='y')
+        plt.tight_layout()
+        plt.show()
+    else:
+        print(f"No data to plot {car_col_name} Distribution by Sector.")
+
+
+# --- Part 11: Statistical Significance Tests on CARs ---
+
+print("\n--- Performing Statistical Significance Tests on CARs ---")
+
+for car_col_name in ['CAR5', 'CAR10', 'CAR120']:
+    sample = fama_merge[car_col_name].dropna()
+    if not sample.empty:
+        t_stat, p_val = ttest_1samp(sample, 0)
+        print(f"\nT-test for {car_col_name}: t-stat = {t_stat:.4f}, p-value = {p_val:.4e}")
+        if p_val < 0.05:
+            print(f"The mean {car_col_name} is statistically significantly different from 0 (p < 0.05).")
+        else:
+            print(f"The mean {car_col_name} is NOT significantly different from 0.")
+    else:
+        print(f"\nNo data to perform T-test for {car_col_name}.")
